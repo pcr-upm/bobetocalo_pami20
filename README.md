@@ -14,6 +14,7 @@ https://doi.org/10.1109/TPAMI.2020.3046323
 #### Requisites
 - faces_framework https://github.com/bobetocalo/faces_framework
 - ert_simple https://github.com/bobetocalo/ert_simple
+- Tensorflow (v1.8.0)
 
 #### Installation
 This repository must be located inside the following directory:
@@ -34,6 +35,7 @@ You need to have a C++ compiler (supporting C++11):
 ```
 #### Usage
 Use the --measure option to set the face alignment normalization.
+
 Use the --database option to load the proper trained model.
 ```
 > ./release/face_multitask_bobetocalo_pami20_test --measure pupils --database cofw
