@@ -1,0 +1,368 @@
+/** ****************************************************************************
+ *  @file    ShapeCascade.hpp
+ *  @brief   Face detection and recognition framework
+ *  @author  Roberto Valle Fernandez
+ *  @date    2020/10
+ *  @copyright All rights reserved.
+ *  Software developed by UPM PCR Group: http://www.dia.fi.upm.es/~pcr
+ ******************************************************************************/
+
+// ------------------ RECURSION PROTECTION -------------------------------------
+#ifndef SHAPE_CASCADE_HPP
+#define SHAPE_CASCADE_HPP
+
+#define SAVE_ERROR_FILE
+
+// ----------------------- INCLUDES --------------------------------------------
+#include <utils.hpp>
+#include <FaceAnnotation.hpp>
+#include <ModernPosit.h>
+#include <ChannelFeatures.hpp>
+#include <HonariChannelFeatures.hpp>
+#include <LearningAlgorithm.hpp>
+#include <transformation.hpp>
+#include <cereal/access.hpp>
+#include <cereal/types/vector.hpp>
+#include <serialization.hpp>
+#include <opencv2/opencv.hpp>
+#include <numeric>
+#include <fstream>
+
+namespace upm {
+
+enum class ChannelFeature { honari };
+enum class InitialShape { honari };
+enum class RuntimeMode { train, test };
+const unsigned int MAX_NUM_LEVELS = 50;
+
+/** ****************************************************************************
+ * @class ShapeCascade
+ * @brief Use cascade of regression trees that can localize facial landmarks.
+ ******************************************************************************/
+class ShapeCascade
+{
+public:
+  /// Train predictor
+  ShapeCascade
+    (
+    const cv::Size2f &shape_size,
+    const cv::Mat &robust_shape,
+    const cv::Mat &robust_label,
+    const std::vector<cv::Mat> &initial_shapes,
+    const std::vector<cv::Mat> &initial_labels,
+    const std::vector<LearningAlgorithm::EnsembleTrees> &forests,
+    const std::vector<std::vector<std::vector<int>>> &landmarks,
+    const std::string &path,
+    const std::string &database,
+    const ChannelFeature &feature_mode,
+    const InitialShape &initial_mode,
+    const int &feats_convergence_iter
+    )
+  {
+    _shape_size = shape_size;
+    _robust_shape = robust_shape.clone();
+    _robust_label = robust_label.clone();
+    _initial_shapes = initial_shapes;
+    _initial_labels = initial_labels;
+    _forests = forests;
+    _landmarks = landmarks;
+    _feature_mode = feature_mode;
+    _initial_mode = initial_mode;
+    _feats_convergence_iter = feats_convergence_iter;
+    _cf.reset(new HonariChannelFeatures(robust_shape, robust_label, path, database));
+    _hcf.reset(new HonariChannelFeatures(robust_shape, robust_label, path, database));
+  };
+
+  /// Test predictor
+  ShapeCascade() {};
+
+  ~ShapeCascade() {};
+
+  void
+  process
+    (
+    const cv::Mat &img,
+    FaceAnnotation &face,
+    const FaceAnnotation &ann,
+    const ErrorMeasure &measure,
+    const std::string &path,
+    const std::map< FacePartLabel,std::vector<int> > &cnn_parts,
+    const std::vector<unsigned int> &cnn_landmarks,
+    std::unique_ptr<tensorflow::Session> &session
+    )
+  {
+    /// Resize bounding box annotation
+    float scale = 1.0f;
+    FaceBox box_scaled = face.bbox;
+    box_scaled.pos.x *= scale;
+    box_scaled.pos.y *= scale;
+    box_scaled.pos.width  *= scale;
+    box_scaled.pos.height *= scale;
+
+    /// Map shape from normalized space into the image dimension
+    const unsigned int num_landmarks = static_cast<unsigned int>(_robust_shape.rows);
+    cv::Mat utform = unnormalizingTransform(box_scaled.pos, _shape_size);
+
+    /// Load MNN channels required to obtain probability metric only once
+    std::shared_ptr<HonariChannelFeatures> hcf(_hcf);
+    hcf->loadChannelsGenerator();
+    cv::Rect_<float> prob_bbox = hcf->enlargeBbox(box_scaled.pos);
+    std::vector<float> prob_poses, prob_poses_euler, prob_poses_proj, prob_visibilities;
+    std::vector<cv::Mat> prob_channels = hcf->generateChannels(img, prob_bbox, cnn_parts, cnn_landmarks, session, prob_poses_euler, prob_poses_proj, prob_visibilities);
+    face.headpose = cv::Point3f(prob_poses_euler[0], prob_poses_euler[1], prob_poses_euler[2]);
+    /// Load feature channels into memory only once
+    std::shared_ptr<ChannelFeatures> cf(_cf);
+    cf->loadChannelsGenerator();
+    cf->loadFeaturesDescriptor();
+    cv::Rect_<float> feat_bbox = cf->enlargeBbox(box_scaled.pos);
+    std::vector<cv::Mat> feat_channels;
+    for (const cv::Mat &channel : prob_channels)
+      feat_channels.push_back(channel.clone());
+    /// Set bbox according to cropped channel features
+    cv::Point2f feat_scale = cv::Point2f(feat_channels[0].cols/feat_bbox.width, feat_channels[0].rows/feat_bbox.height);
+    feat_scale *= hcf->map_scale;
+    feat_bbox = cv::Rect_<float>(box_scaled.pos.x-feat_bbox.x, box_scaled.pos.y-feat_bbox.y, box_scaled.pos.width, box_scaled.pos.height);
+    feat_bbox.x *= feat_scale.x;
+    feat_bbox.y *= feat_scale.y;
+    feat_bbox.width *= feat_scale.x;
+    feat_bbox.height *= feat_scale.y;
+    cv::Mat feat_utform = unnormalizingTransform(feat_bbox, _shape_size);
+
+    /// Run algorithm several times using different initializations
+    const unsigned int num_initial_shapes = static_cast<int>(_initial_shapes.size());
+    std::vector<cv::Mat> current_shapes(num_initial_shapes), current_labels(num_initial_shapes), current_rigids(num_initial_shapes);
+    for (unsigned int i=0; i < num_initial_shapes; i++)
+    {
+      cv::RNG rnd = cv::RNG();
+      FaceAnnotation initial_face = generateInitialShape(path, RuntimeMode::test, cnn_landmarks, prob_bbox, prob_visibilities, scale, hcf->map_scale, prob_poses_proj, rnd);
+      const cv::Mat ntform = normalizingTransform(box_scaled.pos, _shape_size);
+      current_shapes[i] = cv::Mat::zeros(num_landmarks,3,CV_32FC1);
+      current_labels[i] = cv::Mat::zeros(num_landmarks,1,CV_32FC1);
+      facePartsToShape(initial_face.parts, ntform, scale, current_shapes[i], current_labels[i]);
+    }
+
+    #ifdef SAVE_ERROR_FILE
+    FaceAnnotation current;
+    bestEstimation(current_shapes, current_labels, utform, scale, ann, measure, current);
+    std::vector<unsigned int> indices;
+    std::vector<float> errors, metrics;
+    getNormalizedErrors(current, ann, measure, indices, errors);
+    std::fstream ofs_loss("output/err/test_loss.txt", std::ios::app);
+    ofs_loss << 100.0f * cv::Mat(errors).t();
+    metrics = getProbabilityMetric(current.parts, prob_channels, prob_bbox, scale, hcf->map_scale);
+    std::fstream ofs_metric("output/err/test_metric.txt", std::ios::app);
+    ofs_metric << 100.0f * cv::Mat(metrics).t();
+    #endif
+    for (unsigned int i=0; i < _forests.size(); i++)
+    {
+      for (unsigned int j=0; j < num_initial_shapes; j++)
+      {
+        /// Global similarity transform that maps 'robust_shape' to 'current_shape'
+        float level = static_cast<float>(i) / static_cast<float>(MAX_NUM_LEVELS);
+        current_rigids[j] = findSimilarityTransform(_robust_shape, current_shapes[j], current_labels[j]);
+        cv::Mat features = cf->extractFeatures(feat_channels, box_scaled.pos.height, current_rigids[j], feat_utform, current_shapes[j], level);
+        /// Update sample using a mean residual
+        cv::Mat mean_residual = cv::Mat::zeros(num_landmarks,3,CV_32FC1);
+        for (unsigned int f=0; f < _forests[i].size(); f++)
+          for (unsigned int t=0; t < _forests[i][f].size(); t++)
+            mean_residual += _forests[i][f][t].leafs[_forests[i][f][t].predict(features)].residual;
+        addResidualToShape(mean_residual, current_shapes[j]);
+      }
+      #ifdef SAVE_ERROR_FILE
+      bestEstimation(current_shapes, current_labels, utform, scale, ann, measure, current);
+      indices.clear();
+      errors.clear();
+      metrics.clear();
+      getNormalizedErrors(current, ann, measure, indices, errors);
+      ofs_loss << " " << 100.0f * cv::Mat(errors).t();
+      metrics = getProbabilityMetric(current.parts, prob_channels, prob_bbox, scale, hcf->map_scale);
+      ofs_metric << " " << 100.0f * cv::Mat(metrics).t();
+      #endif
+    }
+    #ifdef SAVE_ERROR_FILE
+    ofs_loss << std::endl;
+    ofs_loss.close();
+    ofs_metric << std::endl;
+    ofs_metric.close();
+    #endif
+    /// Facial feature location obtained
+    bestEstimation(current_shapes, current_labels, utform, scale, ann, measure, face);
+  };
+
+  static FaceAnnotation
+  generateInitialShape
+    (
+    const std::string &path,
+    const RuntimeMode &runtime_mode,
+    const std::vector<unsigned int> &cnn_landmarks,
+    const cv::Rect_<float> &prob_bbox,
+    const std::vector<float> &visibilities,
+    const float &scale,
+    const float &map_scale,
+    const std::vector<float> &pose,
+    cv::RNG &rnd
+    )
+  {
+    /// Robust correspondences
+    const std::vector<unsigned int> mask = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
+    /// Load 3D face shape
+    std::vector<cv::Point3f> world_all;
+    std::vector<unsigned int> index_all;
+    ModernPosit::loadWorldShape(path + "../../../headpose/posit/data/", DB_LANDMARKS, world_all, index_all);
+    /// Intrinsic parameters
+    cv::Rect_<float> bbox_cnn = cv::Rect_<float>(0, 0, prob_bbox.width, prob_bbox.height);
+    double focal_length = static_cast<double>(bbox_cnn.width) * 1.5;
+    cv::Point2f face_center = (bbox_cnn.tl() + bbox_cnn.br()) * 0.5f;
+    cv::Mat cam_matrix = (cv::Mat_<float>(3,3) << focal_length,0,face_center.x, 0,focal_length,face_center.y, 0,0,1);
+    /// Extrinsic parameters
+    cv::Mat rot_matrix, trl_matrix;
+    /// Estimated pose
+    cv::Point3f headpose = cv::Point3f(pose[0], pose[1], pose[2]);
+    rot_matrix = ModernPosit::eulerToRotationMatrix(headpose);
+    trl_matrix = (cv::Mat_<float>(3,1) << pose[3],pose[4],pose[5]);
+    if (runtime_mode == RuntimeMode::train)
+    {
+      cv::Point3f headpose = ModernPosit::rotationMatrixToEuler(rot_matrix);
+      headpose += cv::Point3f(rnd.uniform(-20.0f,20.0f),rnd.uniform(-10.0f,10.0f),rnd.uniform(-10.0f,10.0f));
+      rot_matrix = ModernPosit::eulerToRotationMatrix(headpose);
+    }
+    /// Project 3D shape into 2D landmarks
+    cv::Mat rot_vector;
+    cv::Rodrigues(rot_matrix, rot_vector);
+    std::vector<cv::Point2f> image_all_proj;
+    cv::projectPoints(world_all, rot_vector, trl_matrix, cam_matrix, cv::Mat(), image_all_proj);
+    headpose = ModernPosit::rotationMatrixToEuler(rot_matrix);
+    FaceAnnotation initial_face;
+    for (const auto &db_part : DB_PARTS)
+      for (int feature_idx : db_part.second)
+      {
+        FaceLandmark landmark;
+        landmark.feature_idx = feature_idx;
+        unsigned int shape_idx = std::distance(index_all.begin(),std::find(index_all.begin(),index_all.end(),feature_idx));
+        landmark.pos.x = (prob_bbox.x + image_all_proj[shape_idx].x) / scale;
+        landmark.pos.y = (prob_bbox.y + image_all_proj[shape_idx].y) / scale;
+        shape_idx = std::distance(cnn_landmarks.begin(), std::find(cnn_landmarks.begin(),cnn_landmarks.end(),feature_idx));
+        landmark.occluded = setSelfOcclusion(headpose, landmark.feature_idx) ? 1.0f : 1.0f-visibilities[shape_idx];
+        initial_face.parts[db_part.first].landmarks.push_back(landmark);
+      }
+    return initial_face;
+  };
+
+  static bool
+  setSelfOcclusion
+    (
+    const cv::Point3f &headpose,
+    const int &feature_idx
+    )
+  {
+    bool occluded = false;
+    if (DB_LANDMARKS.size() == 68)
+    {
+      if ((std::find(DB_PARTS[FacePartLabel::lear].begin(),DB_PARTS[FacePartLabel::lear].end(),feature_idx) != DB_PARTS[FacePartLabel::lear].end()) and (headpose.x < -15.0f))
+        occluded = true;
+      else if ((std::find(DB_PARTS[FacePartLabel::rear].begin(),DB_PARTS[FacePartLabel::rear].end(),feature_idx) != DB_PARTS[FacePartLabel::rear].end()) and (headpose.x > 15.0f))
+        occluded = true;
+      else if ((feature_idx == 107 or feature_idx == 108) and headpose.x < -15.0f)
+        occluded = true;
+      else if ((feature_idx == 110 or feature_idx == 111) and headpose.x > 15.0f)
+        occluded = true;
+      else if ((std::find(DB_PARTS[FacePartLabel::leye].begin(),DB_PARTS[FacePartLabel::leye].end(),feature_idx) != DB_PARTS[FacePartLabel::leye].end() or (std::find(DB_PARTS[FacePartLabel::leyebrow].begin(),DB_PARTS[FacePartLabel::leyebrow].end(),feature_idx) != DB_PARTS[FacePartLabel::leyebrow].end())) and (headpose.x < -40.0f))
+        occluded = true;
+      else if ((std::find(DB_PARTS[FacePartLabel::reye].begin(),DB_PARTS[FacePartLabel::reye].end(),feature_idx) != DB_PARTS[FacePartLabel::reye].end() or (std::find(DB_PARTS[FacePartLabel::reyebrow].begin(),DB_PARTS[FacePartLabel::reyebrow].end(),feature_idx) != DB_PARTS[FacePartLabel::reyebrow].end())) and (headpose.x > 40.0f))
+        occluded = true;
+    }
+    return occluded;
+  }
+
+  static void
+  bestEstimation
+    (
+    const std::vector<cv::Mat> &shapes,
+    const std::vector<cv::Mat> &labels,
+    const cv::Mat &tform,
+    const float scale,
+    const FaceAnnotation &ann,
+    const ErrorMeasure &measure,
+    FaceAnnotation &face
+    )
+  {
+    unsigned int best_idx = 0;
+    float err, best_err = std::numeric_limits<float>::max();
+    const unsigned int num_initials = shapes.size();
+    for (unsigned int i=0; i < num_initials; i++)
+    {
+      FaceAnnotation current;
+      shapeToFaceParts(shapes[i], labels[i], tform, scale, current.parts);
+      std::vector<unsigned int> indices;
+      std::vector<float> errors;
+      getNormalizedErrors(current, ann, measure, indices, errors);
+      err = std::accumulate(errors.begin(),errors.end(),0.0) / static_cast<float>(errors.size());
+      if (err < best_err)
+      {
+        best_err = err;
+        best_idx = i;
+      }
+    }
+    shapeToFaceParts(shapes[best_idx], labels[best_idx], tform, scale, face.parts);
+  };
+
+  static std::vector<float>
+  getProbabilityMetric
+    (
+    const std::vector<FacePart> &parts,
+    const std::vector<cv::Mat> &prob_channels,
+    const cv::Rect_<float> &prob_bbox,
+    const float &scale,
+    const float &map_scale
+    )
+  {
+    const unsigned int num_landmarks = prob_channels.size();
+    std::vector<cv::Mat> img_channels(num_landmarks);
+    for (unsigned int i=0; i < num_landmarks; i++)
+      cv::resize(prob_channels[i], img_channels[i], cv::Size(), map_scale, map_scale, cv::INTER_LINEAR);
+
+    /// Transform current shape coordinates to CNN channel size
+    cv::Mat tform = normalizingTransform(prob_bbox, img_channels[0].size());
+    cv::Mat shape = cv::Mat::zeros(num_landmarks,3,CV_32FC1);
+    cv::Mat label = cv::Mat::zeros(num_landmarks,1,CV_32FC1);
+    facePartsToShape(parts, tform, scale, shape, label);
+
+    /// Return probability value for each landmark
+    std::vector<float> values;
+    for (unsigned int i=0; i < shape.rows; i++)
+      if (label.at<float>(i,0) == 1.0f)
+      {
+        int x = static_cast<int>(shape.at<float>(i,0) + 0.5f);
+        int y = static_cast<int>(shape.at<float>(i,1) + 0.5f);
+        x = x < 0 ? 0 : x > img_channels[i].cols-1 ? img_channels[i].cols-1 : x;
+        y = y < 0 ? 0 : y > img_channels[i].rows-1 ? img_channels[i].rows-1 : y;
+        values.push_back(img_channels[i].at<float>(y,x));
+      }
+    return values;
+  };
+
+  friend class cereal::access;
+  template<class Archive>
+  void serialize(Archive &ar, const unsigned version)
+  {
+    ar & _shape_size & _robust_shape & _robust_label & _initial_shapes & _initial_labels & _forests & _landmarks & _initial_mode & _feature_mode & _feats_convergence_iter & _cf & _hcf;
+  };
+
+private:
+  cv::Size2f _shape_size;
+  cv::Mat _robust_shape;
+  cv::Mat _robust_label;
+  std::vector<cv::Mat> _initial_shapes;
+  std::vector<cv::Mat> _initial_labels;
+  std::vector<LearningAlgorithm::EnsembleTrees> _forests;
+  std::vector<std::vector<std::vector<int>>> _landmarks;
+  InitialShape _initial_mode;
+  ChannelFeature _feature_mode;
+  int _feats_convergence_iter;
+  std::shared_ptr<ChannelFeatures> _cf;
+  std::shared_ptr<HonariChannelFeatures> _hcf;
+};
+
+} // namespace upm
+
+#endif /* SHAPE_CASCADE_HPP */
