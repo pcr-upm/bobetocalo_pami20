@@ -11,8 +11,6 @@
 #ifndef SHAPE_CASCADE_HPP
 #define SHAPE_CASCADE_HPP
 
-#define SAVE_ERROR_FILE
-
 // ----------------------- INCLUDES --------------------------------------------
 #include <utils.hpp>
 #include <FaceAnnotation.hpp>
@@ -126,20 +124,7 @@ public:
       facePartsToShape(initial_face.parts, ntform, 1.0f, current_shapes[i], current_labels[i]);
     }
 
-    #ifdef SAVE_ERROR_FILE
-    FaceAnnotation current;
-    bestEstimation(current_shapes, current_labels, utform, ann, measure, current);
-    std::vector<unsigned int> indices;
-    std::vector<float> errors, metrics;
-    getNormalizedErrors(current, ann, measure, indices, errors);
-    std::fstream ofs_loss("output/err/test_loss.txt", std::ios::app);
-    ofs_loss << 100.0f * cv::Mat(errors).t();
-    metrics = getProbabilityMetric(current.parts, channels, bbox, hcf->map_scale);
-    std::fstream ofs_metric("output/err/test_metric.txt", std::ios::app);
-    ofs_metric << 100.0f * cv::Mat(metrics).t();
-    #endif
     for (unsigned int i=0; i < _forests.size(); i++)
-    {
       for (unsigned int j=0; j < num_initial_shapes; j++)
       {
         /// Global similarity transform that maps 'robust_shape' to 'current_shape'
@@ -153,23 +138,6 @@ public:
             mean_residual += tree.leafs[tree.predict(features)].residual;
         addResidualToShape(mean_residual, current_shapes[j]);
       }
-      #ifdef SAVE_ERROR_FILE
-      bestEstimation(current_shapes, current_labels, utform, ann, measure, current);
-      indices.clear();
-      errors.clear();
-      metrics.clear();
-      getNormalizedErrors(current, ann, measure, indices, errors);
-      ofs_loss << " " << 100.0f * cv::Mat(errors).t();
-      metrics = getProbabilityMetric(current.parts, channels, bbox, hcf->map_scale);
-      ofs_metric << " " << 100.0f * cv::Mat(metrics).t();
-      #endif
-    }
-    #ifdef SAVE_ERROR_FILE
-    ofs_loss << std::endl;
-    ofs_loss.close();
-    ofs_metric << std::endl;
-    ofs_metric.close();
-    #endif
     /// Facial feature location obtained
     bestEstimation(current_shapes, current_labels, utform, ann, measure, face);
   };
@@ -277,40 +245,6 @@ static FaceAnnotation
       }
     }
     shapeToFaceParts(shapes[best_idx], labels[best_idx], tform, 1.0f, face.parts);
-  };
-
-  static std::vector<float>
-  getProbabilityMetric
-    (
-    const std::vector<FacePart> &parts,
-    const std::vector<cv::Mat> &channels,
-    const cv::Rect_<float> &bbox,
-    const float &map_scale
-    )
-  {
-    const auto num_landmarks = static_cast<unsigned int>(channels.size());
-    std::vector<cv::Mat> img_channels(num_landmarks);
-    for (unsigned int i=0; i < num_landmarks; i++)
-      cv::resize(channels[i], img_channels[i], cv::Size(), map_scale, map_scale, cv::INTER_LINEAR);
-
-    /// Transform current shape coordinates to CNN channel size
-    cv::Mat tform = normalizingTransform(bbox, img_channels[0].size());
-    cv::Mat shape = cv::Mat::zeros(num_landmarks,3,CV_32FC1);
-    cv::Mat label = cv::Mat::zeros(num_landmarks,1,CV_32FC1);
-    facePartsToShape(parts, tform, 1.0f, shape, label);
-
-    /// Return probability value for each landmark
-    std::vector<float> values;
-    for (unsigned int i=0; i < shape.rows; i++)
-      if (label.at<float>(i,0) == 1.0f)
-      {
-        int x = static_cast<int>(shape.at<float>(i,0) + 0.5f);
-        int y = static_cast<int>(shape.at<float>(i,1) + 0.5f);
-        x = x < 0 ? 0 : x > img_channels[i].cols-1 ? img_channels[i].cols-1 : x;
-        y = y < 0 ? 0 : y > img_channels[i].rows-1 ? img_channels[i].rows-1 : y;
-        values.push_back(img_channels[i].at<float>(y,x));
-      }
-    return values;
   };
 
   friend class cereal::access;
