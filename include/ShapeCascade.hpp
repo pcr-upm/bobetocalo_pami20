@@ -93,28 +93,20 @@ public:
   {
     /// Map shape from normalized space into the image dimension
     const auto num_landmarks = static_cast<unsigned int>(_robust_shape.rows);
-    FaceBox box_scaled = face.bbox;
-    cv::Mat utform = unnormalizingTransform(box_scaled.pos, _shape_size);
+    cv::Mat utform = unnormalizingTransform(face.bbox.pos, _shape_size);
 
-    /// Load MNN channels required to obtain probability metric only once
+    /// Load MNN channels into memory only once
     std::shared_ptr<HonariChannelFeatures> hcf(_hcf);
-    hcf->loadChannelsGenerator();
-    cv::Rect_<float> prob_bbox = hcf->enlargeBbox(box_scaled.pos);
-    std::vector<float> prob_poses, prob_poses_euler, prob_poses_proj, prob_visibilities;
-    std::vector<cv::Mat> prob_channels = hcf->generateChannels(img, prob_bbox, cnn_parts, cnn_landmarks, session, prob_poses_euler, prob_poses_proj, prob_visibilities);
-    face.headpose = cv::Point3f(prob_poses_euler[0], prob_poses_euler[1], prob_poses_euler[2]);
-    /// Load feature channels into memory only once
-    std::shared_ptr<ChannelFeatures> cf(_cf);
-    cf->loadChannelsGenerator();
-    cf->loadFeaturesDescriptor();
-    cv::Rect_<float> feat_bbox = cf->enlargeBbox(box_scaled.pos);
-    std::vector<cv::Mat> feat_channels;
-    for (const cv::Mat &channel : prob_channels)
-      feat_channels.push_back(channel.clone());
+    cv::Rect_<float> bbox = hcf->enlargeBbox(face.bbox.pos);
+    std::vector<float> poses_ed, poses_ae, visibilities;
+    std::vector<cv::Mat> channels = hcf->generateChannels(img, bbox, cnn_parts, cnn_landmarks, session, poses_ed, poses_ae, visibilities);
+    face.headpose = cv::Point3f(poses_ed[0], poses_ed[1], poses_ed[2]);
+
     /// Set bbox according to cropped channel features
-    cv::Point2f feat_scale = cv::Point2f(feat_channels[0].cols/feat_bbox.width, feat_channels[0].rows/feat_bbox.height);
+    cv::Rect_<float> feat_bbox = bbox;
+    cv::Point2f feat_scale = cv::Point2f(channels[0].cols/feat_bbox.width, channels[0].rows/feat_bbox.height);
     feat_scale *= hcf->map_scale;
-    feat_bbox = cv::Rect_<float>(box_scaled.pos.x-feat_bbox.x, box_scaled.pos.y-feat_bbox.y, box_scaled.pos.width, box_scaled.pos.height);
+    feat_bbox = cv::Rect_<float>(face.bbox.pos.x-feat_bbox.x, face.bbox.pos.y-feat_bbox.y, face.bbox.pos.width, face.bbox.pos.height);
     feat_bbox.x *= feat_scale.x;
     feat_bbox.y *= feat_scale.y;
     feat_bbox.width *= feat_scale.x;
@@ -127,8 +119,8 @@ public:
     for (unsigned int i=0; i < num_initial_shapes; i++)
     {
       cv::RNG rnd = cv::RNG();
-      FaceAnnotation initial_face = generateInitialShape(path, RuntimeMode::test, cnn_landmarks, prob_bbox, prob_visibilities, hcf->map_scale, prob_poses_proj, rnd);
-      const cv::Mat ntform = normalizingTransform(box_scaled.pos, _shape_size);
+      FaceAnnotation initial_face = generateInitialShape(path, RuntimeMode::test, cnn_landmarks, bbox, poses_ae, visibilities, hcf->map_scale, rnd);
+      const cv::Mat ntform = normalizingTransform(face.bbox.pos, _shape_size);
       current_shapes[i] = cv::Mat::zeros(num_landmarks,3,CV_32FC1);
       current_labels[i] = cv::Mat::zeros(num_landmarks,1,CV_32FC1);
       facePartsToShape(initial_face.parts, ntform, 1.0f, current_shapes[i], current_labels[i]);
@@ -142,7 +134,7 @@ public:
     getNormalizedErrors(current, ann, measure, indices, errors);
     std::fstream ofs_loss("output/err/test_loss.txt", std::ios::app);
     ofs_loss << 100.0f * cv::Mat(errors).t();
-    metrics = getProbabilityMetric(current.parts, prob_channels, prob_bbox, hcf->map_scale);
+    metrics = getProbabilityMetric(current.parts, channels, bbox, hcf->map_scale);
     std::fstream ofs_metric("output/err/test_metric.txt", std::ios::app);
     ofs_metric << 100.0f * cv::Mat(metrics).t();
     #endif
@@ -153,12 +145,12 @@ public:
         /// Global similarity transform that maps 'robust_shape' to 'current_shape'
         float level = static_cast<float>(i) / static_cast<float>(MAX_NUM_LEVELS);
         current_rigids[j] = findSimilarityTransform(_robust_shape, current_shapes[j], current_labels[j]);
-        cv::Mat features = cf->extractFeatures(feat_channels, box_scaled.pos.height, current_rigids[j], feat_utform, current_shapes[j], level);
+        cv::Mat features = hcf->extractFeatures(channels, face.bbox.pos.height, current_rigids[j], feat_utform, current_shapes[j], level);
         /// Update sample using a mean residual
         cv::Mat mean_residual = cv::Mat::zeros(num_landmarks,3,CV_32FC1);
-        for (unsigned int f=0; f < _forests[i].size(); f++)
-          for (unsigned int t=0; t < _forests[i][f].size(); t++)
-            mean_residual += _forests[i][f][t].leafs[_forests[i][f][t].predict(features)].residual;
+        for (const auto &trees : _forests[i])
+          for (const auto &tree : trees)
+            mean_residual += tree.leafs[tree.predict(features)].residual;
         addResidualToShape(mean_residual, current_shapes[j]);
       }
       #ifdef SAVE_ERROR_FILE
@@ -168,7 +160,7 @@ public:
       metrics.clear();
       getNormalizedErrors(current, ann, measure, indices, errors);
       ofs_loss << " " << 100.0f * cv::Mat(errors).t();
-      metrics = getProbabilityMetric(current.parts, prob_channels, prob_bbox, hcf->map_scale);
+      metrics = getProbabilityMetric(current.parts, channels, bbox, hcf->map_scale);
       ofs_metric << " " << 100.0f * cv::Mat(metrics).t();
       #endif
     }
@@ -189,9 +181,9 @@ static FaceAnnotation
     const RuntimeMode &runtime_mode,
     const std::vector<unsigned int> &cnn_landmarks,
     const cv::Rect_<float> &bbox,
+    const std::vector<float> &poses,
     const std::vector<float> &visibilities,
     const float &map_scale,
-    const std::vector<float> &poses,
     cv::RNG &rnd
     )
   {
@@ -269,7 +261,7 @@ static FaceAnnotation
   {
     unsigned int best_idx = 0;
     float err, best_err = std::numeric_limits<float>::max();
-    const unsigned int num_initials = shapes.size();
+    const auto num_initials = static_cast<unsigned int>(shapes.size());
     for (unsigned int i=0; i < num_initials; i++)
     {
       FaceAnnotation current;
@@ -277,7 +269,7 @@ static FaceAnnotation
       std::vector<unsigned int> indices;
       std::vector<float> errors;
       getNormalizedErrors(current, ann, measure, indices, errors);
-      err = std::accumulate(errors.begin(),errors.end(),0.0) / static_cast<float>(errors.size());
+      err = static_cast<float>(std::accumulate(errors.begin(),errors.end(),0.0)) / static_cast<float>(errors.size());
       if (err < best_err)
       {
         best_err = err;
@@ -296,7 +288,7 @@ static FaceAnnotation
     const float &map_scale
     )
   {
-    const unsigned int num_landmarks = channels.size();
+    const auto num_landmarks = static_cast<unsigned int>(channels.size());
     std::vector<cv::Mat> img_channels(num_landmarks);
     for (unsigned int i=0; i < num_landmarks; i++)
       cv::resize(channels[i], img_channels[i], cv::Size(), map_scale, map_scale, cv::INTER_LINEAR);
