@@ -91,16 +91,9 @@ public:
     std::unique_ptr<tensorflow::Session> &session
     )
   {
-    /// Resize bounding box annotation
-    float scale = 1.0f;
-    FaceBox box_scaled = face.bbox;
-    box_scaled.pos.x *= scale;
-    box_scaled.pos.y *= scale;
-    box_scaled.pos.width  *= scale;
-    box_scaled.pos.height *= scale;
-
     /// Map shape from normalized space into the image dimension
-    const unsigned int num_landmarks = static_cast<unsigned int>(_robust_shape.rows);
+    const auto num_landmarks = static_cast<unsigned int>(_robust_shape.rows);
+    FaceBox box_scaled = face.bbox;
     cv::Mat utform = unnormalizingTransform(box_scaled.pos, _shape_size);
 
     /// Load MNN channels required to obtain probability metric only once
@@ -134,22 +127,22 @@ public:
     for (unsigned int i=0; i < num_initial_shapes; i++)
     {
       cv::RNG rnd = cv::RNG();
-      FaceAnnotation initial_face = generateInitialShape(path, RuntimeMode::test, cnn_landmarks, prob_bbox, prob_visibilities, scale, hcf->map_scale, prob_poses_proj, rnd);
+      FaceAnnotation initial_face = generateInitialShape(path, RuntimeMode::test, cnn_landmarks, prob_bbox, prob_visibilities, hcf->map_scale, prob_poses_proj, rnd);
       const cv::Mat ntform = normalizingTransform(box_scaled.pos, _shape_size);
       current_shapes[i] = cv::Mat::zeros(num_landmarks,3,CV_32FC1);
       current_labels[i] = cv::Mat::zeros(num_landmarks,1,CV_32FC1);
-      facePartsToShape(initial_face.parts, ntform, scale, current_shapes[i], current_labels[i]);
+      facePartsToShape(initial_face.parts, ntform, 1.0f, current_shapes[i], current_labels[i]);
     }
 
     #ifdef SAVE_ERROR_FILE
     FaceAnnotation current;
-    bestEstimation(current_shapes, current_labels, utform, scale, ann, measure, current);
+    bestEstimation(current_shapes, current_labels, utform, ann, measure, current);
     std::vector<unsigned int> indices;
     std::vector<float> errors, metrics;
     getNormalizedErrors(current, ann, measure, indices, errors);
     std::fstream ofs_loss("output/err/test_loss.txt", std::ios::app);
     ofs_loss << 100.0f * cv::Mat(errors).t();
-    metrics = getProbabilityMetric(current.parts, prob_channels, prob_bbox, scale, hcf->map_scale);
+    metrics = getProbabilityMetric(current.parts, prob_channels, prob_bbox, hcf->map_scale);
     std::fstream ofs_metric("output/err/test_metric.txt", std::ios::app);
     ofs_metric << 100.0f * cv::Mat(metrics).t();
     #endif
@@ -169,13 +162,13 @@ public:
         addResidualToShape(mean_residual, current_shapes[j]);
       }
       #ifdef SAVE_ERROR_FILE
-      bestEstimation(current_shapes, current_labels, utform, scale, ann, measure, current);
+      bestEstimation(current_shapes, current_labels, utform, ann, measure, current);
       indices.clear();
       errors.clear();
       metrics.clear();
       getNormalizedErrors(current, ann, measure, indices, errors);
       ofs_loss << " " << 100.0f * cv::Mat(errors).t();
-      metrics = getProbabilityMetric(current.parts, prob_channels, prob_bbox, scale, hcf->map_scale);
+      metrics = getProbabilityMetric(current.parts, prob_channels, prob_bbox, hcf->map_scale);
       ofs_metric << " " << 100.0f * cv::Mat(metrics).t();
       #endif
     }
@@ -186,45 +179,41 @@ public:
     ofs_metric.close();
     #endif
     /// Facial feature location obtained
-    bestEstimation(current_shapes, current_labels, utform, scale, ann, measure, face);
+    bestEstimation(current_shapes, current_labels, utform, ann, measure, face);
   };
 
-  static FaceAnnotation
+static FaceAnnotation
   generateInitialShape
     (
     const std::string &path,
     const RuntimeMode &runtime_mode,
     const std::vector<unsigned int> &cnn_landmarks,
-    const cv::Rect_<float> &prob_bbox,
+    const cv::Rect_<float> &bbox,
     const std::vector<float> &visibilities,
-    const float &scale,
     const float &map_scale,
-    const std::vector<float> &pose,
+    const std::vector<float> &poses,
     cv::RNG &rnd
     )
   {
-    /// Robust correspondences
-    const std::vector<unsigned int> mask = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
     /// Load 3D face shape
     std::vector<cv::Point3f> world_all;
     std::vector<unsigned int> index_all;
     ModernPosit::loadWorldShape(path + "../../../headpose/posit/data/", DB_LANDMARKS, world_all, index_all);
     /// Intrinsic parameters
-    cv::Rect_<float> bbox_cnn = cv::Rect_<float>(0, 0, prob_bbox.width, prob_bbox.height);
+    cv::Rect_<float> bbox_cnn = cv::Rect_<float>(0, 0, bbox.width, bbox.height);
     double focal_length = static_cast<double>(bbox_cnn.width) * 1.5;
     cv::Point2f face_center = (bbox_cnn.tl() + bbox_cnn.br()) * 0.5f;
     cv::Mat cam_matrix = (cv::Mat_<float>(3,3) << focal_length,0,face_center.x, 0,focal_length,face_center.y, 0,0,1);
     /// Extrinsic parameters
     cv::Mat rot_matrix, trl_matrix;
-    /// Estimated pose
-    cv::Point3f headpose = cv::Point3f(pose[0], pose[1], pose[2]);
+    cv::Point3f headpose = cv::Point3f(poses[0], poses[1], poses[2]);
     rot_matrix = ModernPosit::eulerToRotationMatrix(headpose);
-    trl_matrix = (cv::Mat_<float>(3,1) << pose[3],pose[4],pose[5]);
+    trl_matrix = (cv::Mat_<float>(3,1) << poses[3],poses[4],poses[5]);
     if (runtime_mode == RuntimeMode::train)
     {
-      cv::Point3f headpose = ModernPosit::rotationMatrixToEuler(rot_matrix);
-      headpose += cv::Point3f(rnd.uniform(-20.0f,20.0f),rnd.uniform(-10.0f,10.0f),rnd.uniform(-10.0f,10.0f));
-      rot_matrix = ModernPosit::eulerToRotationMatrix(headpose);
+      cv::Point3f headpose_train = ModernPosit::rotationMatrixToEuler(rot_matrix);
+      headpose_train += cv::Point3f(rnd.uniform(-20.0f,20.0f),rnd.uniform(-10.0f,10.0f),rnd.uniform(-10.0f,10.0f));
+      rot_matrix = ModernPosit::eulerToRotationMatrix(headpose_train);
     }
     /// Project 3D shape into 2D landmarks
     cv::Mat rot_vector;
@@ -237,11 +226,11 @@ public:
       for (int feature_idx : db_part.second)
       {
         FaceLandmark landmark;
-        landmark.feature_idx = feature_idx;
-        unsigned int shape_idx = std::distance(index_all.begin(),std::find(index_all.begin(),index_all.end(),feature_idx));
-        landmark.pos.x = (prob_bbox.x + image_all_proj[shape_idx].x) / scale;
-        landmark.pos.y = (prob_bbox.y + image_all_proj[shape_idx].y) / scale;
-        shape_idx = std::distance(cnn_landmarks.begin(), std::find(cnn_landmarks.begin(),cnn_landmarks.end(),feature_idx));
+        landmark.feature_idx = static_cast<unsigned int>(feature_idx);
+        auto shape_idx = static_cast<unsigned int>(std::distance(index_all.begin(),std::find(index_all.begin(),index_all.end(),feature_idx)));
+        landmark.pos.x = (bbox.x + image_all_proj[shape_idx].x);
+        landmark.pos.y = (bbox.y + image_all_proj[shape_idx].y);
+        shape_idx = static_cast<unsigned int>(std::distance(cnn_landmarks.begin(), std::find(cnn_landmarks.begin(),cnn_landmarks.end(),feature_idx)));
         landmark.occluded = setSelfOcclusion(headpose, landmark.feature_idx) ? 1.0f : 1.0f-visibilities[shape_idx];
         initial_face.parts[db_part.first].landmarks.push_back(landmark);
       }
@@ -256,21 +245,14 @@ public:
     )
   {
     bool occluded = false;
-    if (DB_LANDMARKS.size() == 68)
-    {
-      if ((std::find(DB_PARTS[FacePartLabel::lear].begin(),DB_PARTS[FacePartLabel::lear].end(),feature_idx) != DB_PARTS[FacePartLabel::lear].end()) and (headpose.x < -15.0f))
-        occluded = true;
-      else if ((std::find(DB_PARTS[FacePartLabel::rear].begin(),DB_PARTS[FacePartLabel::rear].end(),feature_idx) != DB_PARTS[FacePartLabel::rear].end()) and (headpose.x > 15.0f))
-        occluded = true;
-      else if ((feature_idx == 107 or feature_idx == 108) and headpose.x < -15.0f)
-        occluded = true;
-      else if ((feature_idx == 110 or feature_idx == 111) and headpose.x > 15.0f)
-        occluded = true;
-      else if ((std::find(DB_PARTS[FacePartLabel::leye].begin(),DB_PARTS[FacePartLabel::leye].end(),feature_idx) != DB_PARTS[FacePartLabel::leye].end() or (std::find(DB_PARTS[FacePartLabel::leyebrow].begin(),DB_PARTS[FacePartLabel::leyebrow].end(),feature_idx) != DB_PARTS[FacePartLabel::leyebrow].end())) and (headpose.x < -40.0f))
-        occluded = true;
-      else if ((std::find(DB_PARTS[FacePartLabel::reye].begin(),DB_PARTS[FacePartLabel::reye].end(),feature_idx) != DB_PARTS[FacePartLabel::reye].end() or (std::find(DB_PARTS[FacePartLabel::reyebrow].begin(),DB_PARTS[FacePartLabel::reyebrow].end(),feature_idx) != DB_PARTS[FacePartLabel::reyebrow].end())) and (headpose.x > 40.0f))
-        occluded = true;
-    }
+    if ((std::find(DB_PARTS[FacePartLabel::lear].begin(),DB_PARTS[FacePartLabel::lear].end(),feature_idx) != DB_PARTS[FacePartLabel::lear].end()) and (headpose.x < -15.0f))
+      occluded = true;
+    else if ((std::find(DB_PARTS[FacePartLabel::rear].begin(),DB_PARTS[FacePartLabel::rear].end(),feature_idx) != DB_PARTS[FacePartLabel::rear].end()) and (headpose.x > 15.0f))
+      occluded = true;
+    else if ((std::find(DB_PARTS[FacePartLabel::leye].begin(),DB_PARTS[FacePartLabel::leye].end(),feature_idx) != DB_PARTS[FacePartLabel::leye].end() or (std::find(DB_PARTS[FacePartLabel::leyebrow].begin(),DB_PARTS[FacePartLabel::leyebrow].end(),feature_idx) != DB_PARTS[FacePartLabel::leyebrow].end())) and (headpose.x < -40.0f))
+      occluded = true;
+    else if ((std::find(DB_PARTS[FacePartLabel::reye].begin(),DB_PARTS[FacePartLabel::reye].end(),feature_idx) != DB_PARTS[FacePartLabel::reye].end() or (std::find(DB_PARTS[FacePartLabel::reyebrow].begin(),DB_PARTS[FacePartLabel::reyebrow].end(),feature_idx) != DB_PARTS[FacePartLabel::reyebrow].end())) and (headpose.x > 40.0f))
+      occluded = true;
     return occluded;
   }
 
@@ -280,7 +262,6 @@ public:
     const std::vector<cv::Mat> &shapes,
     const std::vector<cv::Mat> &labels,
     const cv::Mat &tform,
-    const float scale,
     const FaceAnnotation &ann,
     const ErrorMeasure &measure,
     FaceAnnotation &face
@@ -292,7 +273,7 @@ public:
     for (unsigned int i=0; i < num_initials; i++)
     {
       FaceAnnotation current;
-      shapeToFaceParts(shapes[i], labels[i], tform, scale, current.parts);
+      shapeToFaceParts(shapes[i], labels[i], tform, 1.0f, current.parts);
       std::vector<unsigned int> indices;
       std::vector<float> errors;
       getNormalizedErrors(current, ann, measure, indices, errors);
@@ -303,29 +284,28 @@ public:
         best_idx = i;
       }
     }
-    shapeToFaceParts(shapes[best_idx], labels[best_idx], tform, scale, face.parts);
+    shapeToFaceParts(shapes[best_idx], labels[best_idx], tform, 1.0f, face.parts);
   };
 
   static std::vector<float>
   getProbabilityMetric
     (
     const std::vector<FacePart> &parts,
-    const std::vector<cv::Mat> &prob_channels,
-    const cv::Rect_<float> &prob_bbox,
-    const float &scale,
+    const std::vector<cv::Mat> &channels,
+    const cv::Rect_<float> &bbox,
     const float &map_scale
     )
   {
-    const unsigned int num_landmarks = prob_channels.size();
+    const unsigned int num_landmarks = channels.size();
     std::vector<cv::Mat> img_channels(num_landmarks);
     for (unsigned int i=0; i < num_landmarks; i++)
-      cv::resize(prob_channels[i], img_channels[i], cv::Size(), map_scale, map_scale, cv::INTER_LINEAR);
+      cv::resize(channels[i], img_channels[i], cv::Size(), map_scale, map_scale, cv::INTER_LINEAR);
 
     /// Transform current shape coordinates to CNN channel size
-    cv::Mat tform = normalizingTransform(prob_bbox, img_channels[0].size());
+    cv::Mat tform = normalizingTransform(bbox, img_channels[0].size());
     cv::Mat shape = cv::Mat::zeros(num_landmarks,3,CV_32FC1);
     cv::Mat label = cv::Mat::zeros(num_landmarks,1,CV_32FC1);
-    facePartsToShape(parts, tform, scale, shape, label);
+    facePartsToShape(parts, tform, 1.0f, shape, label);
 
     /// Return probability value for each landmark
     std::vector<float> values;
