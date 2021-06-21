@@ -1,3 +1,8 @@
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/multi-task-head-pose-estimation-in-the-wild/head-pose-estimation-on-aflw2000)](https://paperswithcode.com/sota/head-pose-estimation-on-aflw2000?p=multi-task-head-pose-estimation-in-the-wild)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/multi-task-head-pose-estimation-in-the-wild/face-alignment-on-aflw2000-3d)](https://paperswithcode.com/sota/face-alignment-on-aflw2000-3d?p=multi-task-head-pose-estimation-in-the-wild)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/multi-task-head-pose-estimation-in-the-wild/head-pose-estimation-on-biwi)](https://paperswithcode.com/sota/head-pose-estimation-on-biwi?p=multi-task-head-pose-estimation-in-the-wild)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/multi-task-head-pose-estimation-in-the-wild/face-alignment-on-cofw)](https://paperswithcode.com/sota/face-alignment-on-cofw?p=multi-task-head-pose-estimation-in-the-wild)
+
 # Multi-task head pose estimation in-the-wild
 
 We provide C++ code in order to replicate the head-pose experiments in our paper https://ieeexplore.ieee.org/document/9303369
